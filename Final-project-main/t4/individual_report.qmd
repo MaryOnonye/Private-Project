@@ -1,0 +1,385 @@
+---
+title: "Complaint Type Specificity and Critical Violation Rates"
+subtitle: "STA 9750 | Individual Report | Restaurant Complaints vs Inspection Risk in NYC"
+author: "Group Member 4"
+date: "2026-05-12"
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    self-contained: true
+    highlight-style: tango
+    code-fold: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  echo: true
+  message: false
+  warning: false
+  fig-align: center
+---
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center"
+)
+```
+
+## Contribution to the Overarching Question
+
+This report is one of five individual analyses contributing to the team project:
+*Restaurant Complaints vs Inspection Risk in NYC*. The overarching question is:
+
+> **Do neighborhoods with higher complaint activity experience systematically worse
+> restaurant inspection outcomes?**
+
+The team's SQ1 and SQ2 analyses treat all food-related 311 complaints as a single
+aggregate signal. My contribution disaggregates that signal to ask a more precise
+question: are all complaint types equally informative, or do specific kinds of
+citizen concern carry stronger predictive power for food safety outcomes? This matters
+for both the interpretation of the overarching question and for its practical application
+,  if certain complaint types are stronger predictors of critical violations, regulators
+could prioritize inspection responses to those specific complaint categories rather than
+treating all food-related 311 activity as equivalent.
+
+The specific question I address is:
+
+> **Which types of food-related complaints are most strongly associated with
+> higher neighborhood-level critical violation rates?**
+
+The four complaint types available in the dataset are: Rodent, Food Establishment,
+Food Poisoning, and Unsanitary Condition. My hypothesis entering the analysis is that
+Rodent complaints will show the strongest association with critical violations, since
+rodent presence is a direct sanitation failure and one of the most heavily weighted
+violation categories in the DOHMH inspection rubric. I test this hypothesis and
+examine what the results reveal about the nature of the complaint-inspection
+relationship across complaint categories., ## Setup
+
+```{r packages}
+pkgs <- c("tidyverse","lubridate","scales","knitr",
+          "kableExtra","broom","glue","httr2","jsonlite")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+library(tidyverse); library(lubridate); library(scales)
+library(knitr); library(kableExtra); library(broom); library(glue)
+```
+
+```{r theme}
+theme_nyc <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(color = "grey40", size = 12),
+      plot.caption  = element_text(color = "grey55", size = 9),
+      axis.title    = element_text(size = 11),
+      panel.grid.minor = element_blank()
+    )
+}
+```, ## Data Acquisition
+
+```{r fetch-helper}
+fetch_all_socrata <- function(dataset_id, query = "",
+                               select = NULL, page_size = 50000) {
+  base_url <- glue(
+    "https://data.cityofnewyork.us/resource/{dataset_id}.json"
+  )
+  offset <- 0; pages <- list()
+  repeat {
+    req <- request(base_url) |>
+      req_url_query(`$limit` = page_size, `$offset` = offset,
+                    `$where` = query)
+    if (!is.null(select)) req <- req |> req_url_query(`$select` = select)
+    page <- req |> req_retry(max_tries = 3) |> req_perform() |>
+      resp_body_json(simplifyVector = TRUE) |> as_tibble()
+    if (nrow(page) == 0) break
+    message(glue("  {dataset_id}: {offset + nrow(page)} rows"))
+    pages[[length(pages) + 1]] <- page
+    if (nrow(page) < page_size) break
+    offset <- offset + page_size
+  }
+  bind_rows(pages)
+}
+```
+
+```{r load-data, cache=TRUE}
+dir.create("data", showWarnings = FALSE)
+if (!file.exists("data/raw_inspections.rds")) {
+  raw_inspections <- fetch_all_socrata(
+    "43nn-pn8j",
+    query = "inspection_date >= '2022-01-01T00:00:00'",
+    select = "camis,boro,zipcode,inspection_date,score,grade,critical_flag"
+  )
+  saveRDS(raw_inspections, "data/raw_inspections.rds")
+} else { raw_inspections <- readRDS("data/raw_inspections.rds") }
+
+if (!file.exists("data/raw_311.rds")) {
+  raw_311 <- fetch_all_socrata(
+    "erm2-nwe9",
+    query = paste("complaint_type IN ('Food Establishment',",
+                  "'Food Poisoning','Rodent','Unsanitary Condition')",
+                  "AND created_date >= '2022-01-01T00:00:00'"),
+    select = "unique_key,complaint_type,created_date,borough,incident_zip"
+  )
+  saveRDS(raw_311, "data/raw_311.rds")
+} else { raw_311 <- readRDS("data/raw_311.rds") }
+```, ## Data Cleaning
+
+```{r clean}
+inspections <- raw_inspections |>
+  mutate(
+    inspection_date = as_date(inspection_date),
+    score           = as.numeric(score),
+    grade           = str_trim(grade),
+    grade           = if_else(grade %in% c("A","B","C"),
+                              grade, NA_character_),
+    is_critical     = str_detect(tolower(critical_flag),"critical") &
+                      !str_detect(tolower(critical_flag),"not"),
+    borough         = str_to_upper(str_trim(boro)),
+    zipcode         = str_pad(str_extract(zipcode,"\\d{5}"),5,"left","0"),
+    year            = year(inspection_date)
+  ) |>
+  filter(!is.na(inspection_date), year >= 2022,
+         borough %in% c("BRONX","BROOKLYN","MANHATTAN",
+                        "QUEENS","STATEN ISLAND"),
+         !is.na(zipcode), zipcode != "00000")
+
+complaints <- raw_311 |>
+  mutate(
+    date    = as_date(created_date),
+    year    = year(date),
+    borough = str_to_upper(str_trim(borough)),
+    zipcode = str_pad(str_extract(incident_zip,"\\d{5}"),5,"left","0"),
+    complaint_type = str_trim(complaint_type)
+  ) |>
+  filter(!is.na(date), year >= 2022,
+         borough %in% c("BRONX","BROOKLYN","MANHATTAN",
+                        "QUEENS","STATEN ISLAND"),
+         !is.na(zipcode), zipcode != "00000")
+
+rm(raw_inspections, raw_311); gc()
+```, ## Exploratory Data Analysis
+
+```{r eda-complaint-volumes}
+# Understand the relative volume of each complaint type before
+# computing correlations ,  volume differences affect interpretability
+complaints |>
+  count(complaint_type, sort = TRUE) |>
+  mutate(
+    pct = n / sum(n),
+    complaint_type = fct_reorder(complaint_type, n)
+  ) |>
+  ggplot(aes(x = n, y = complaint_type, fill = complaint_type)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(comma(n)," (",percent(pct,accuracy=0.1),")")),
+            hjust = -0.05, size = 3.5) +
+  scale_x_continuous(labels = comma,
+                     expand = expansion(mult = c(0, 0.3))) +
+  scale_fill_manual(values = c(
+    "Rodent"               = "#E76F51",
+    "Food Establishment"   = "#264653",
+    "Food Poisoning"       = "#2A9D8F",
+    "Unsanitary Condition" = "#E9C46A"
+  )) +
+  labs(
+    title    = "Food-Related 311 Complaint Volumes by Type",
+    subtitle = "Rodent complaints dominate, comprising over 70% of total volume",
+    x = "Total Complaints (2022-2026)", y = NULL,
+    caption = "Source: NYC 311 (2022-2026)"
+  ) +
+  theme_nyc()
+```
+
+Rodent complaints account for over 70% of all food-related 311 activity in the
+dataset, making it the dominant signal by volume. Food Establishment complaints
+represent roughly 22%, Food Poisoning about 6%, and Unsanitary Condition less than
+1%. This volume imbalance is important context for interpreting the correlation
+results: a complaint type with very few observations (Unsanitary Condition) will
+have noisier correlation estimates than one with many thousands.
+
+```{r eda-borough-type}
+# How does complaint type composition vary across boroughs?
+complaints |>
+  count(borough, complaint_type) |>
+  group_by(borough) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(x = borough, y = pct, fill = complaint_type)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c(
+    "Rodent"               = "#E76F51",
+    "Food Establishment"   = "#264653",
+    "Food Poisoning"       = "#2A9D8F",
+    "Unsanitary Condition" = "#E9C46A"
+  )) +
+  labs(
+    title    = "Complaint Type Composition by Borough",
+    subtitle = "Composition is broadly consistent across boroughs",
+    x = NULL, y = "Share of Complaints", fill = "Complaint Type",
+    caption = "Source: NYC 311 (2022-2026)"
+  ) +
+  theme_nyc()
+```, ## Analysis
+
+### Building the ZIP-Level Dataset
+
+```{r sq4-data}
+# ZIP-level complaint counts per type ,  wide format for correlation analysis
+sq4_complaints <- complaints |>
+  count(zipcode, complaint_type) |>
+  pivot_wider(names_from = complaint_type, values_from = n,
+              values_fill = 0)
+
+# ZIP-level inspection outcomes ,  require >= 10 inspections for stable estimates
+sq4_inspections <- inspections |>
+  group_by(zipcode) |>
+  summarise(
+    n_inspections = n_distinct(paste(camis, inspection_date)),
+    pct_critical  = mean(is_critical, na.rm = TRUE),
+    mean_score    = mean(score,        na.rm = TRUE),
+    pct_grade_a   = mean(grade == "A", na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(n_inspections >= 10)
+
+sq4_data <- sq4_inspections |>
+  left_join(sq4_complaints, by = "zipcode")
+
+complaint_cols <- intersect(
+  names(sq4_data),
+  unique(complaints$complaint_type)
+)
+
+cat("ZIP observations:", nrow(sq4_data), "\n")
+cat("Complaint types available:", paste(complaint_cols, collapse = ", "), "\n")
+```
+
+### Correlation Analysis
+
+```{r sq4-cors}
+# Compute Pearson correlation independently for each complaint type
+# against three inspection outcome measures. Minimum 10 ZIPs with
+# non-zero values required for a stable correlation estimate.
+sq4_cors <- map_dfr(complaint_cols, function(ct) {
+  vals <- sq4_data[[ct]]
+  if (sum(!is.na(vals) & vals > 0) < 10) return(NULL)
+  tibble(
+    complaint_type   = ct,
+    cor_pct_critical = cor(vals, sq4_data$pct_critical,
+                           use = "pairwise.complete.obs"),
+    cor_mean_score   = cor(vals, sq4_data$mean_score,
+                           use = "pairwise.complete.obs"),
+    cor_pct_grade_a  = cor(vals, sq4_data$pct_grade_a,
+                           use = "pairwise.complete.obs"),
+    n_zips           = sum(!is.na(vals) & vals > 0)
+  )
+}) |>
+  filter(!is.na(cor_pct_critical)) |>
+  arrange(desc(abs(cor_pct_critical)))
+
+sq4_cors |>
+  kable(
+    digits    = 4,
+    caption   = "Complaint Type Correlations with Inspection Outcomes (ZIP level)",
+    col.names = c("Complaint Type","Cor w/ % Critical",
+                  "Cor w/ Mean Score","Cor w/ % Grade A","ZIP Count")
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"))
+```
+
+```{r sq4-plot}
+sq4_cors |>
+  mutate(complaint_type = fct_reorder(complaint_type, cor_pct_critical),
+         direction = if_else(cor_pct_critical >= 0,"Positive","Negative")) |>
+  ggplot(aes(x = cor_pct_critical, y = complaint_type, fill = direction)) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  geom_vline(xintercept = 0, linewidth = 0.9) +
+  geom_text(aes(label = round(cor_pct_critical, 3),
+                hjust = if_else(cor_pct_critical >= 0, -0.2, 1.2)),
+            size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("Positive" = "#E76F51",
+                               "Negative" = "#2A9D8F")) +
+  scale_x_continuous(expand = expansion(mult = 0.25)) +
+  labs(
+    title    = "Which Complaint Types Best Predict Critical Violations?",
+    subtitle = "Pearson correlation with % critical violations at ZIP level",
+    x = "Correlation with % Critical Violations", y = NULL,
+    caption = "Sources: DOHMH Inspections, NYC 311 (2022-2026)"
+  ) +
+  theme_nyc()
+```
+
+### Scatter Plots by Complaint Type
+
+```{r sq4-scatter-grid}
+# Visualize the raw ZIP-level scatter for each complaint type
+# to verify correlations are not driven by outliers
+sq4_long <- sq4_data |>
+  select(zipcode, pct_critical, all_of(complaint_cols)) |>
+  pivot_longer(all_of(complaint_cols),
+               names_to = "complaint_type", values_to = "count") |>
+  filter(count > 0)
+
+ggplot(sq4_long, aes(x = count, y = pct_critical)) +
+  geom_point(alpha = 0.4, color = "#264653", size = 1.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "#E76F51",
+              linewidth = 1) +
+  facet_wrap(~ complaint_type, scales = "free_x") +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title    = "ZIP-Level Scatter: Each Complaint Type vs % Critical Violations",
+    subtitle = "All four types show positive trends; slopes differ by type",
+    x = "Complaint Count", y = "% Critical Violations",
+    caption = "Sources: DOHMH Inspections, NYC 311 (2022-2026)"
+  ) +
+  theme_nyc()
+```, ## Findings and Interpretation
+
+The correlation results produce a finding that challenges the initial hypothesis.
+Food Establishment complaints ,  not Rodent complaints ,  show the strongest correlation
+with critical violation rates (r = 0.157), followed by Rodent (r = 0.116), Food
+Poisoning (r = 0.109), and Unsanitary Condition (r = 0.047). Crucially, all four
+complaint types show positive correlations with both critical violation rates and mean
+inspection scores, and negative correlations with grade-A rates. The directional
+consistency across all outcome measures strengthens confidence that these are genuine
+associations rather than statistical artifacts.
+
+The stronger performance of Food Establishment complaints over Rodent complaints is
+interpretable on reflection. The Food Establishment category is a broad catch-all that
+captures a wide range of concerns ,  food handling practices, visible cleanliness,
+storage conditions, pest evidence, and general restaurant hygiene ,  whereas Rodent
+complaints are specific to one type of sanitation failure. This breadth may give Food
+Establishment complaints greater predictive power because they capture a more
+comprehensive signal about overall restaurant quality. Rodent complaints, while directly
+tied to a major DOHMH violation category, reflect only one dimension of food safety
+risk. Food Poisoning complaints perform similarly to Rodent (r = 0.109), suggesting
+that health outcomes reported by consumers carry meaningful signal despite the
+under-reporting inherent in attributing illness to a specific establishment. Unsanitary
+Condition complaints show the weakest association, likely because this category
+captures a heterogeneous mix of concerns ,  including street cleanliness and non-food
+establishments ,  that dilutes its restaurant-specific signal.
+
+The scatter plots by complaint type confirm that these correlations are not driven
+by extreme outliers. The positive slope holds broadly across the range of complaint
+counts for each type, though with considerable within-type variation that is
+consistent with the modest correlation magnitudes.
+
+One important limitation is that the Pearson correlations computed here are bivariate
+and do not control for other factors. Higher Food Establishment complaint volume in a
+ZIP may be correlated with restaurant density, which in turn affects inspection
+frequency and outcome distributions. The team's SQ2 analysis addresses this confounding
+more rigorously through OLS regression with borough fixed effects, but type-specific
+controlled regressions remain a natural extension of this work., ## Connection to the Overarching Question
+
+This analysis adds precision to the team's answer to the overarching question. Not
+all complaints are equal: Food Establishment complaints carry the strongest signal
+about neighborhood-level food safety risk, followed by Rodent, Food Poisoning, and
+Unsanitary Condition. This finding has direct policy implications ,  inspection
+prioritization algorithms that weight complaint types differentially could achieve
+better targeting of enforcement resources than treating all food-related 311 activity
+as equivalent. The finding also refines the theoretical interpretation: the
+complaint-inspection outcome relationship is not simply about the volume of citizen
+concern but about the specific nature of what citizens are reporting., ## Session Info
+
+```{r session}
+sessionInfo()
+```

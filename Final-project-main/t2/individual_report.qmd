@@ -1,0 +1,383 @@
+---
+title: "Complaint Volume and Inspection Outcome Association"
+subtitle: "STA 9750 | Individual Report | Restaurant Complaints vs Inspection Risk in NYC"
+author: "Group Member 2"
+date: "2026-05-12"
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    self-contained: true
+    highlight-style: tango
+    code-fold: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  echo: true
+  message: false
+  warning: false
+  fig-align: center
+---
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center"
+)
+```
+
+## Contribution to the Overarching Question
+
+This report is one of five individual analyses contributing to the team project:
+*Restaurant Complaints vs Inspection Risk in NYC*. The overarching question is:
+
+> **Do neighborhoods with higher complaint activity experience systematically worse
+> restaurant inspection outcomes?**
+
+My contribution addresses this question most directly. While other team members
+examine specific dimensions ,  persistence of violations, temporal dynamics, complaint
+type specificity, and regulatory response speed ,  this analysis tests the core
+association between food-related 311 complaint volume and inspection performance at
+the ZIP code level. This is the broadest and most direct test of the overarching
+question: controlling for borough, does a neighborhood that generates more complaints
+also perform worse when the health inspector arrives?
+
+The specific question I address is:
+
+> **Are neighborhoods with higher food-related 311 complaint volume associated with
+> worse restaurant inspection outcomes?**
+
+Inspection outcomes are operationalized in two ways: the mean inspection score (where
+higher scores indicate worse outcomes) and the proportion of inspections receiving an
+A grade. Complaint volume is measured as the total count of food-related 311 complaints
+filed in a ZIP code across the study period, log-transformed to account for the
+multiplicative nature of the relationship., ## Setup
+
+```{r packages}
+pkgs <- c("tidyverse","lubridate","scales","knitr",
+          "kableExtra","ggcorrplot","broom","glue",
+          "httr2","jsonlite","plotly")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(tidyverse); library(lubridate); library(scales)
+library(knitr); library(kableExtra); library(ggcorrplot)
+library(broom); library(glue); library(plotly)
+```
+
+```{r theme}
+theme_nyc <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 15),
+      plot.subtitle    = element_text(color = "grey40", size = 12),
+      plot.caption     = element_text(color = "grey55", size = 9),
+      axis.title       = element_text(size = 11),
+      panel.grid.minor = element_blank()
+    )
+}
+borough_colors <- c(
+  "BRONX" = "#E76F51", "BROOKLYN" = "#2A9D8F",
+  "MANHATTAN" = "#264653", "QUEENS" = "#E9C46A",
+  "STATEN ISLAND" = "#A8DADC"
+)
+```, ## Data Acquisition
+
+```{r fetch-helper}
+fetch_all_socrata <- function(dataset_id, query = "",
+                               select = NULL, page_size = 50000) {
+  base_url <- glue(
+    "https://data.cityofnewyork.us/resource/{dataset_id}.json"
+  )
+  offset <- 0; pages <- list()
+  repeat {
+    req <- request(base_url) |>
+      req_url_query(`$limit` = page_size, `$offset` = offset,
+                    `$where` = query)
+    if (!is.null(select)) req <- req |> req_url_query(`$select` = select)
+    page <- req |> req_retry(max_tries = 3) |> req_perform() |>
+      resp_body_json(simplifyVector = TRUE) |> as_tibble()
+    if (nrow(page) == 0) break
+    message(glue("  {dataset_id}: {offset + nrow(page)} rows"))
+    pages[[length(pages) + 1]] <- page
+    if (nrow(page) < page_size) break
+    offset <- offset + page_size
+  }
+  bind_rows(pages)
+}
+```
+
+```{r load-data, cache=TRUE}
+dir.create("data", showWarnings = FALSE)
+
+if (!file.exists("data/raw_inspections.rds")) {
+  raw_inspections <- fetch_all_socrata(
+    "43nn-pn8j",
+    query  = "inspection_date >= '2022-01-01T00:00:00'",
+    select = "camis,boro,zipcode,inspection_date,score,grade,critical_flag"
+  )
+  saveRDS(raw_inspections, "data/raw_inspections.rds")
+} else { raw_inspections <- readRDS("data/raw_inspections.rds") }
+
+if (!file.exists("data/raw_311.rds")) {
+  raw_311 <- fetch_all_socrata(
+    "erm2-nwe9",
+    query = paste("complaint_type IN ('Food Establishment',",
+                  "'Food Poisoning','Rodent','Unsanitary Condition')",
+                  "AND created_date >= '2022-01-01T00:00:00'"),
+    select = "unique_key,complaint_type,created_date,borough,incident_zip"
+  )
+  saveRDS(raw_311, "data/raw_311.rds")
+} else { raw_311 <- readRDS("data/raw_311.rds") }
+
+cat("Inspections:", nrow(raw_inspections), "| 311:", nrow(raw_311), "\n")
+```, ## Data Cleaning
+
+```{r clean}
+inspections <- raw_inspections |>
+  mutate(
+    inspection_date = as_date(inspection_date),
+    score           = as.numeric(score),
+    grade           = str_trim(grade),
+    grade           = if_else(grade %in% c("A","B","C"),
+                              grade, NA_character_),
+    is_critical     = str_detect(tolower(critical_flag), "critical") &
+                      !str_detect(tolower(critical_flag), "not"),
+    borough         = str_to_upper(str_trim(boro)),
+    zipcode         = str_pad(str_extract(zipcode, "\\d{5}"),
+                              5, "left", "0"),
+    year            = year(inspection_date),
+    month           = floor_date(inspection_date, "month")
+  ) |>
+  filter(!is.na(inspection_date), year >= 2022,
+         borough %in% c("BRONX","BROOKLYN","MANHATTAN",
+                        "QUEENS","STATEN ISLAND"),
+         !is.na(zipcode), zipcode != "00000")
+
+complaints <- raw_311 |>
+  mutate(
+    date    = as_date(created_date),
+    year    = year(date),
+    borough = str_to_upper(str_trim(borough)),
+    zipcode = str_pad(str_extract(incident_zip, "\\d{5}"), 5, "left", "0"),
+    complaint_type = str_trim(complaint_type)
+  ) |>
+  filter(!is.na(date), year >= 2022,
+         borough %in% c("BRONX","BROOKLYN","MANHATTAN",
+                        "QUEENS","STATEN ISLAND"),
+         !is.na(zipcode), zipcode != "00000")
+
+rm(raw_inspections, raw_311); gc()
+cat("Clean inspections:", nrow(inspections),
+    "| Clean complaints:", nrow(complaints), "\n")
+```, ## Exploratory Data Analysis
+
+```{r eda-score-borough}
+# Score distributions reveal baseline borough variation before
+# controlling for complaints in the regression
+inspections |>
+  filter(!is.na(score), score > 0) |>
+  ggplot(aes(x = score, fill = borough)) +
+  geom_histogram(binwidth = 2, show.legend = FALSE) +
+  facet_wrap(~ borough, ncol = 3) +
+  scale_fill_manual(values = borough_colors) +
+  labs(
+    title    = "Inspection Score Distributions by Borough",
+    subtitle = "Higher scores = worse outcomes. Score 0-13 qualifies for Grade A.",
+    x = "Inspection Score", y = "Count",
+    caption = "Source: DOHMH Inspections (2022-2026)"
+  ) +
+  theme_nyc()
+```
+
+Score distributions are right-skewed across all boroughs, with most inspections
+falling in the Grade A range (score 0–13). Queens and Brooklyn show heavier right
+tails ,  consistent with the regression finding that both boroughs perform
+significantly worse than the Bronx even after controlling for complaint volume.
+
+```{r eda-complaint-score}
+# Quick ZIP-level preview of the complaint-score relationship
+# before formal modelling to verify it is not driven by outliers
+zip_preview <- inspections |>
+  group_by(zipcode, borough) |>
+  summarise(avg_score = mean(score, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    complaints |> count(zipcode, name = "total_complaints"),
+    by = "zipcode"
+  ) |>
+  filter(!is.na(total_complaints), !is.na(avg_score))
+
+cor_preview <- cor(log1p(zip_preview$total_complaints),
+                   zip_preview$avg_score,
+                   use = "pairwise.complete.obs")
+cat("Raw Pearson correlation (log complaints vs avg score):",
+    round(cor_preview, 3), "\n")
+```
+
+The raw Pearson correlation between log(complaints) and average inspection score is
+r = `r round(cor_preview, 3)` ,  a moderate positive relationship confirming that
+the association is present before any modelling adjustments., ## Analysis
+
+### Building the ZIP-Level Dataset
+
+```{r sq2-data}
+# Aggregate inspection outcomes per ZIP across full study period.
+# Minimum 6 months required for stable averages.
+insp_zip <- inspections |>
+  group_by(zipcode, borough) |>
+  summarise(
+    avg_score       = mean(score,        na.rm = TRUE),
+    pct_critical    = mean(is_critical,  na.rm = TRUE),
+    pct_grade_a     = mean(grade == "A", na.rm = TRUE),
+    n_inspections   = n(),
+    n_months        = n_distinct(month),
+    .groups = "drop"
+  ) |>
+  filter(n_months >= 6, !is.na(avg_score))
+
+comp_zip <- complaints |>
+  count(zipcode, name = "total_complaints")
+
+sq2_data <- insp_zip |>
+  left_join(comp_zip, by = "zipcode") |>
+  filter(!is.na(total_complaints), total_complaints > 0)
+
+cat("ZIP-level observations:", nrow(sq2_data), "\n")
+```
+
+### Correlation Matrix
+
+```{r sq2-corr}
+# Correlation matrix gives overview of pairwise relationships
+# before fitting the regression model
+sq2_cors <- sq2_data |>
+  select(total_complaints, avg_score, pct_critical, pct_grade_a) |>
+  cor(use = "pairwise.complete.obs")
+
+ggcorrplot(
+  sq2_cors,
+  method = "circle", type = "lower",
+  lab = TRUE, lab_size = 4,
+  colors = c("#2A9D8F","white","#E76F51"),
+  title  = "Complaint Volume vs. Inspection Outcomes (ZIP level)"
+) + theme_nyc()
+```
+
+### Scatter Plot with Regression Trend
+
+```{r sq2-scatter}
+# Store as object so we can convert to plotly below
+p_scatter <- ggplot(sq2_data,
+  aes(x = total_complaints, y = avg_score,
+      color = borough,
+      text = paste0("ZIP: ", zipcode, "<br>",
+                    "Borough: ", borough, "<br>",
+                    "Avg Score: ", round(avg_score, 1), "<br>",
+                    "Complaints: ", comma(total_complaints), "<br>",
+                    "% Grade A: ", percent(pct_grade_a)))) +
+  geom_point(alpha = 0.65, size = 2.5) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE,
+              color = "black", linewidth = 1, linetype = "dashed") +
+  scale_x_log10(labels = comma) +
+  scale_color_manual(values = borough_colors) +
+  labs(
+    title    = "More Complaints, Higher (Worse) Inspection Scores",
+    subtitle = "Each point = one ZIP code. Higher score = worse outcome.",
+    x        = "Total Food-Related 311 Complaints (log scale)",
+    y        = "Average Inspection Score",
+    color    = "Borough",
+    caption  = "Sources: DOHMH Inspections, NYC 311 (2022-2026)"
+  ) +
+  theme_nyc()
+
+p_scatter
+```
+
+### OLS Regression
+
+```{r sq2-model}
+# Log transform of complaints reflects multiplicative relationship:
+# doubling complaints from 10 to 20 has a larger marginal effect
+# than from 1000 to 1010. Borough FE controls for density and
+# socioeconomic composition differences across boroughs.
+sq2_model <- lm(avg_score ~ log1p(total_complaints) + borough,
+                data = sq2_data)
+
+tidy(sq2_model) |>
+  kable(digits = 4,
+        caption = "OLS: Avg Inspection Score ~ log(Complaints) + Borough") |>
+  kable_styling(bootstrap_options = c("striped","condensed"))
+
+glance(sq2_model) |>
+  select(r.squared, adj.r.squared, p.value, nobs) |>
+  kable(digits = 4, caption = "Model Fit Summary") |>
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+### Interactive Exploration
+
+```{r sq2-interactive}
+# Interactive chart allows verification that no single ZIP
+# is driving the overall trend
+ggplotly(p_scatter, tooltip = "text") |>
+  layout(hoverlabel = list(bgcolor = "white"))
+```, ## Findings and Interpretation
+
+The OLS regression results provide strong evidence for an association between
+food-related 311 complaint volume and restaurant inspection outcomes at the ZIP code
+level. Each unit increase in log-transformed complaint volume is associated with a
+1.08-point increase in average inspection score (p < 0.0001). Since the DOHMH system
+assigns worse grades to higher scores, this means that ZIP codes generating more
+complaints are systematically receiving worse inspection assessments. The model explains
+34% of the variation in inspection scores ,  a substantial share for a neighborhood-level
+analysis relying on a single behavioral predictor alongside geographic controls.
+
+The correlation matrix reinforces this picture. Total complaints correlates positively
+with average inspection score (r = 0.41) and with the fraction of critical violations
+(r = 0.17), while correlating negatively with the grade-A rate (r = -0.28). These
+relationships are consistent and directionally aligned, confirming that complaint volume
+is a genuine, multi-dimensional predictor of inspection performance rather than a
+proxy for a single narrow outcome.
+
+Borough controls reveal meaningful geographic heterogeneity. Brooklyn and Queens
+perform significantly worse than the Bronx baseline even after controlling for
+complaint volume ,  with coefficients of +1.79 (p = 0.009) and +1.97 (p = 0.002)
+respectively. Manhattan, despite generating the highest raw complaint volumes, does
+not differ significantly from the Bronx once complaint volume is accounted for. This
+suggests that Manhattan's high complaint totals reflect its extraordinary restaurant
+density rather than systematically worse food safety conditions, and that the borough
+fixed effect successfully partials out this confound. Staten Island shows no
+significant difference from the Bronx baseline.
+
+The interactive scatter plot confirms that the positive trend holds across all five
+boroughs and is not driven by a small number of outlier ZIP codes. Queens ZIP codes
+cluster in the upper right ,  high complaints, high scores ,  while Staten Island ZIP
+codes cluster in the lower left. Manhattan ZIP codes, despite high complaint volumes,
+show moderate scores consistent with the regression finding that Manhattan's high
+complaint counts are largely a density artifact.
+
+The primary limitation of this analysis is that it is cross-sectional and cannot
+establish causality. The association between complaint volume and inspection score
+may reflect shared underlying conditions ,  neighborhoods with worse food safety
+environments generate both more complaints and worse inspection outcomes ,  rather
+than complaints being a direct predictor of inspection performance. This limitation
+motivates the temporal analysis in the team's SQ3 report, which tests whether
+complaint spikes precede inspection deterioration or merely co-occur with it., ## Connection to the Overarching Question
+
+This analysis provides the most direct answer to the team's overarching question.
+After controlling for borough-level differences in restaurant density and socioeconomic
+composition, complaint volume remains a significant, positive predictor of worse
+inspection outcomes. ZIP codes that generate more food-related 311 complaints receive
+higher (worse) inspection scores, lower grade-A rates, and more critical violations.
+The relationship is statistically robust, practically meaningful in magnitude, and
+consistent across all five boroughs.
+
+This finding establishes that 311 complaint data is not merely noise ,  it contains
+genuine signal about neighborhood-level food safety risk that is independently
+predictive of what inspectors find when they visit. Whether this signal is leading
+or concurrent is examined in the SQ3 report; how it varies by complaint type is
+examined in the SQ4 report; and whether it accelerates regulatory response is the
+subject of the SQ5 report., ## Session Info
+
+```{r session}
+sessionInfo()
+```
