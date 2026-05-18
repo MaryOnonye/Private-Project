@@ -69,8 +69,15 @@ pkgs <- c("tidyverse", "lubridate", "scales", "knitr",
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 if (length(to_install) > 0) install.packages(to_install)
 
-library(tidyverse); library(lubridate); library(scales)
-library(knitr); library(kableExtra); library(broom); library(glue)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(glue)
+library(httr2)
+library(jsonlite)
 ```
 
 ```{r theme}

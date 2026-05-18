@@ -65,15 +65,20 @@ transient events or reporting artifacts.
 ## Setup
 
 ```{r packages}
-pkgs <- c("tidyverse", "lubridate", "scales",
-          "knitr", "kableExtra", "broom",
-          "glue", "httr2", "jsonlite", "plotly")
+pkgs <- c("tidyverse", "lubridate", "scales", "knitr",
+          "kableExtra", "broom", "glue", "httr2", "jsonlite")
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 if (length(to_install) > 0) install.packages(to_install)
 
-library(tidyverse); library(lubridate); library(scales)
-library(knitr); library(kableExtra); library(broom)
-library(glue); library(httr2); library(jsonlite); library(plotly)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(glue)
+library(httr2)
+library(jsonlite)
 ```
 
 ```{r theme}

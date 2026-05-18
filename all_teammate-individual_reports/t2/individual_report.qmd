@@ -70,14 +70,19 @@ and inspection outcomes at all?
 
 ```{r packages}
 pkgs <- c("tidyverse", "lubridate", "scales", "knitr",
-          "kableExtra", "ggcorrplot", "broom", "glue",
-          "httr2", "jsonlite", "plotly")
+          "kableExtra", "broom", "glue", "httr2", "jsonlite")
 to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
 if (length(to_install) > 0) install.packages(to_install)
 
-library(tidyverse); library(lubridate); library(scales)
-library(knitr); library(kableExtra); library(ggcorrplot)
-library(broom); library(glue); library(plotly)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(glue)
+library(httr2)
+library(jsonlite)
 ```
 
 ```{r theme}
