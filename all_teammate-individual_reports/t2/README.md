@@ -1,4 +1,4 @@
-# STA 9750 Individual Report — Teammate 2
+# STA 9750 Individual Report — Mary Ononye
 
 ## What's in this package
 - `individual_report.qmd` — your individual report file (ready to render)
