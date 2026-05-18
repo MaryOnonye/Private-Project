@@ -1,0 +1,471 @@
+---
+title: "Temporal Dynamics of Complaints and Inspection Outcomes"
+subtitle: "STA 9750 | Individual Report | Restaurant Complaints vs Inspection Risk in NYC"
+author: "Group Member 3"
+date: "2026-05-12"
+format:
+  html:
+    toc: true
+    toc-float: true
+    toc-depth: 3
+    theme: flatly
+    highlight-style: tango
+    code-fold: true
+    fig-width: 10
+    fig-height: 6
+    self-contained: true
+execute:
+  echo: true
+  message: false
+  warning: false
+  fig-align: center
+---
+
+## Overarching Question and My Contribution
+
+This report is one of five individual analyses contributing to the team project
+*Restaurant Complaints vs Inspection Risk in NYC*. The project's overarching question
+asks whether neighborhoods with higher complaint activity experience systematically
+worse restaurant inspection outcomes. The first two analyses in our project establish
+that the answer to this question is yes in a cross-sectional sense: ZIP codes with
+more food-related 311 complaints also show more repeat critical violations and higher
+average inspection scores. My contribution takes the analysis one step further by
+examining the temporal structure of this relationship.
+
+Knowing that complaints and bad inspection outcomes co-occur is useful, but it does
+not tell us whether complaints are leading or lagging indicators of food safety
+deterioration. This distinction has critical practical implications. If complaint
+spikes in month T reliably predict worse inspection outcomes in months T+1, T+2, and
+T+3, then 311 complaints could function as a genuine early warning system: regulators
+who monitored complaint trends could identify deteriorating neighborhoods and deploy
+inspection resources proactively before conditions worsen further. If instead
+complaints and violations are purely contemporaneous signals of the same underlying
+conditions, then 311 data is a concurrent diagnostic of current risk rather than a
+forward-looking predictor of future deterioration.
+
+My specific question is whether increases in neighborhood-level food-related complaints
+precede worse inspection outcomes. I test this by constructing a ZIP-month panel
+dataset and examining whether complaint volume in month T predicts inspection outcomes
+in months T+1, T+2, and T+3, using both lagged Pearson correlations and a panel
+regression with ZIP-level fixed effects that controls for all time-invariant
+neighborhood characteristics.
+
+The answer I find is a carefully qualified no: complaint spikes do not reliably
+predict future inspection deterioration within a one-to-three month window. This null
+finding is not a failure but rather an important clarification of the mechanism
+underlying the cross-sectional association documented by my teammates. It tells us
+that complaints and violations are simultaneous manifestations of the same underlying
+neighborhood food safety environment rather than complaints serving as a leading
+indicator of upcoming violations. This distinction shapes how policymakers should
+think about the appropriate role of 311 data in regulatory targeting.
+
+---
+
+## Setup
+
+```{r packages}
+pkgs <- c("tidyverse", "lubridate", "scales", "knitr",
+          "kableExtra", "broom", "glue", "httr2", "jsonlite")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(tidyverse); library(lubridate); library(scales)
+library(knitr); library(kableExtra); library(broom); library(glue)
+```
+
+```{r theme}
+theme_nyc <- function() {
+  theme_minimal(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", size = 15),
+          plot.subtitle = element_text(color = "grey40", size = 12),
+          plot.caption = element_text(color = "grey55", size = 9),
+          axis.title = element_text(size = 11),
+          panel.grid.minor = element_blank())
+}
+```
+
+---
+
+## Data Acquisition
+
+```{r fetch-helper}
+# Standard paginated Socrata fetcher shared across team reports.
+# The temporal analysis requires both datasets at monthly granularity,
+# so no additional aggregation parameters are needed at acquisition time.
+fetch_all_socrata <- function(dataset_id, query = "",
+                               select = NULL, page_size = 50000) {
+  base_url <- glue("https://data.cityofnewyork.us/resource/{dataset_id}.json")
+  offset <- 0; pages <- list()
+  repeat {
+    req <- request(base_url) |>
+      req_url_query(`$limit` = page_size, `$offset` = offset, `$where` = query)
+    if (!is.null(select)) req <- req |> req_url_query(`$select` = select)
+    page <- req |> req_retry(max_tries = 3) |> req_perform() |>
+      resp_body_json(simplifyVector = TRUE) |> as_tibble()
+    if (nrow(page) == 0) break
+    message(glue("  {dataset_id}: {offset + nrow(page)} rows"))
+    pages[[length(pages) + 1]] <- page
+    if (nrow(page) < page_size) break
+    offset <- offset + page_size
+  }
+  bind_rows(pages)
+}
+```
+
+```{r load-data}
+#| cache: true
+dir.create("data", showWarnings = FALSE)
+
+if (!file.exists("data/raw_inspections.rds")) {
+  raw_inspections <- fetch_all_socrata(
+    "43nn-pn8j", query = "inspection_date >= '2022-01-01T00:00:00'",
+    select = "camis,boro,zipcode,inspection_date,score,critical_flag"
+  )
+  saveRDS(raw_inspections, "data/raw_inspections.rds")
+} else { raw_inspections <- readRDS("data/raw_inspections.rds") }
+
+if (!file.exists("data/raw_311.rds")) {
+  raw_311 <- fetch_all_socrata(
+    "erm2-nwe9",
+    query = paste("complaint_type IN ('Food Establishment','Food Poisoning',",
+                  "'Rodent','Unsanitary Condition')",
+                  "AND created_date >= '2022-01-01T00:00:00'"),
+    select = "unique_key,complaint_type,created_date,borough,incident_zip"
+  )
+  saveRDS(raw_311, "data/raw_311.rds")
+} else { raw_311 <- readRDS("data/raw_311.rds") }
+```
+
+---
+
+## Data Cleaning
+
+```{r clean}
+inspections <- raw_inspections |>
+  mutate(
+    inspection_date = as_date(inspection_date),
+    score           = as.numeric(score),
+    is_critical     = str_detect(tolower(critical_flag), "critical") &
+                      !str_detect(tolower(critical_flag), "not"),
+    borough         = str_to_upper(str_trim(boro)),
+    zipcode         = str_pad(str_extract(zipcode, "\\d{5}"), 5, "left", "0"),
+    year            = year(inspection_date),
+    month           = floor_date(inspection_date, "month")
+  ) |>
+  filter(!is.na(inspection_date), year >= 2022,
+         borough %in% c("BRONX","BROOKLYN","MANHATTAN",
+                        "QUEENS","STATEN ISLAND"),
+         !is.na(zipcode), zipcode != "00000")
+
+complaints <- raw_311 |>
+  mutate(
+    date    = as_date(created_date),
+    year    = year(date),
+    month   = floor_date(date, "month"),
+    borough = str_to_upper(str_trim(borough)),
+    zipcode = str_pad(str_extract(incident_zip, "\\d{5}"), 5, "left", "0")
+  ) |>
+  filter(!is.na(date), year >= 2022,
+         borough %in% c("BRONX","BROOKLYN","MANHATTAN",
+                        "QUEENS","STATEN ISLAND"),
+         !is.na(zipcode), zipcode != "00000")
+
+rm(raw_inspections, raw_311); gc()
+
+# Monthly time series for both datasets
+zip_insp_monthly <- inspections |>
+  group_by(zipcode, month) |>
+  summarise(pct_critical = mean(is_critical, na.rm = TRUE),
+            mean_score   = mean(score,       na.rm = TRUE),
+            .groups = "drop")
+
+zip_comp_monthly <- complaints |>
+  count(zipcode, month, name = "comp_total")
+
+cat("ZIP-month inspection rows:", nrow(zip_insp_monthly), "\n")
+cat("ZIP-month complaint rows:",  nrow(zip_comp_monthly),  "\n")
+```
+
+---
+
+## Data Quality Assessment
+
+The temporal analysis faces a data quality challenge that does not arise in the
+cross-sectional analyses: the alignment of complaint and inspection timing. Both
+complaints and inspections are recorded with specific dates, but inspections do not
+occur on a regular calendar schedule. The DOHMH inspects restaurants on a risk-based
+cycle that can result in gaps of anywhere from a few weeks to well over a year between
+consecutive inspection visits. When both datasets are aggregated to the calendar month,
+a ZIP code's inspection outcome in a given month reflects only those restaurants that
+happened to be inspected that month, which may be a non-representative subset if
+inspections are not uniformly distributed across the calendar year.
+
+This temporal misalignment is a genuine source of noise in the lagged analysis. A
+ZIP code might show high complaint volume in month T but have very few inspections
+in months T+1 through T+3, making it impossible to detect a complaint-to-outcome
+relationship at those lags even if one existed at the restaurant level. Conversely,
+a ZIP code with high inspection activity in a given month might show high critical
+violation rates simply because more inspections were conducted, not because conditions
+were particularly bad that month. These sources of noise would tend to attenuate
+lagged correlations toward zero, meaning the null finding reported here should be
+interpreted as an upper bound on the true lagged relationship rather than as
+definitive evidence of no temporal connection.
+
+A second quality consideration is the length of the study window. The dataset covers
+January 2022 through April 2026, providing approximately 52 months of panel data.
+With a three-month lag specification, the effective analysis window is reduced to
+49 months of outcome observations for each ZIP code. While this is sufficient for
+the lagged correlation analysis, the panel regression with ZIP fixed effects removes
+all between-ZIP variation and relies entirely on within-ZIP changes over time, which
+further reduces the effective variation available for identification. Both of these
+structural limitations reduce statistical power and would tend to produce null results
+even if a genuine lagged relationship existed.
+
+---
+
+## Exploratory Data Analysis
+
+```{r eda-city-trends}
+# City-wide monthly trends in both outcomes simultaneously.
+# Visual inspection of whether complaint and violation trends move together
+# or show lead-lag patterns is informative before formal testing.
+city_monthly <- zip_insp_monthly |>
+  group_by(month) |>
+  summarise(avg_pct_critical = mean(pct_critical, na.rm = TRUE),
+            .groups = "drop") |>
+  left_join(
+    zip_comp_monthly |>
+      group_by(month) |>
+      summarise(total_comp = sum(comp_total), .groups = "drop"),
+    by = "month"
+  )
+
+ggplot(city_monthly, aes(x = month)) +
+  geom_col(aes(y = total_comp / 5000), fill = "#A8DADC", alpha = 0.7) +
+  geom_line(aes(y = avg_pct_critical), color = "#E63946", linewidth = 1.2) +
+  geom_point(aes(y = avg_pct_critical), color = "#E63946", size = 2) +
+  scale_y_continuous(
+    name     = "Avg % Critical Violations",
+    sec.axis = sec_axis(~ . * 5000, name = "Total Complaints",
+                        labels = comma)
+  ) +
+  labs(title = "City-Wide Monthly Trends: Complaints vs Critical Violations",
+       subtitle = "Bars = total complaints (right axis). Line = avg % critical (left axis).",
+       x = NULL, caption = "Sources: DOHMH Inspections, NYC 311 (2022-2026)") +
+  theme_nyc()
+```
+
+The city-wide trend chart reveals an important visual pattern: complaint volumes
+show clear seasonal peaks driven by summer rodent activity, but these seasonal spikes
+do not appear to be followed by corresponding increases in critical violation rates
+in subsequent months. The critical violation rate line remains relatively stable
+across the study period, without obvious upward movements following the complaint
+peaks visible in the bars. This visual pattern anticipates the null finding from the
+formal lagged analysis: complaints and violations are moving according to different
+rhythms, with complaints driven partly by seasonal factors (rodent activity in summer)
+that may not be directly related to the kind of food handling and preparation
+violations that inspectors cite as critical.
+
+```{r eda-within-zip}
+# Examine within-ZIP temporal variation in both complaints and outcomes
+# to assess whether there is sufficient variation for the panel regression
+zip_variation <- zip_comp_monthly |>
+  group_by(zipcode) |>
+  summarise(cv_complaints = sd(comp_total) / mean(comp_total),
+            n_months = n(), .groups = "drop") |>
+  filter(n_months >= 12)
+
+cat("Median coefficient of variation in monthly complaints:",
+    round(median(zip_variation$cv_complaints, na.rm = TRUE), 3), "\n")
+cat("ZIP codes with at least 12 months of data:",
+    nrow(zip_variation), "\n")
+```
+
+The coefficient of variation in monthly complaint volume across ZIP codes is
+relatively high, indicating that complaint volumes do fluctuate substantially from
+month to month within ZIP codes. This within-ZIP variation is necessary for the
+fixed-effects panel regression to have statistical power: if complaint volumes were
+completely stable within each ZIP over time, there would be no within-ZIP variation
+to identify a temporal relationship. The substantial within-ZIP variation in complaint
+volume confirms that the panel regression has the necessary data variation to detect
+a lagged relationship if one exists.
+
+---
+
+## Analysis
+
+### Building the Lagged Panel Dataset
+
+```{r sq3-lag}
+# The make_lag helper shifts complaint month forward by lag_months,
+# effectively asking: given the complaint volume we observed in month T,
+# what were the inspection outcomes in month T + lag_months?
+# This is constructed by shifting the complaint date forward rather than
+# shifting inspection outcomes backward, which is analytically equivalent
+# but computationally cleaner with the left_join approach.
+make_lag <- function(df, lag_months) {
+  df |>
+    mutate(month = month + months(lag_months)) |>
+    rename_with(~ paste0(.x, "_lag", lag_months), comp_total)
+}
+
+sq3_data <- zip_insp_monthly |>
+  left_join(make_lag(zip_comp_monthly, 1), by = c("zipcode","month")) |>
+  left_join(make_lag(zip_comp_monthly, 2), by = c("zipcode","month")) |>
+  left_join(make_lag(zip_comp_monthly, 3), by = c("zipcode","month")) |>
+  filter(!is.na(pct_critical))
+
+cat("Panel rows for lagged analysis:", nrow(sq3_data), "\n")
+cat("Distinct ZIPs:", n_distinct(sq3_data$zipcode), "\n")
+cat("Distinct months:", n_distinct(sq3_data$month), "\n")
+```
+
+### Lagged Correlations
+
+```{r sq3-cors}
+# Pearson correlations between lagged complaint volume and
+# future inspection outcomes across all ZIP-month observations.
+# These pooled correlations do not control for ZIP-level confounders
+# and should be interpreted as descriptive rather than causal.
+lag_cors <- tibble(
+  lag = c("Lag 1 month","Lag 2 months","Lag 3 months"),
+  cor_pct_critical = c(
+    cor(sq3_data$comp_total_lag1, sq3_data$pct_critical,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag2, sq3_data$pct_critical,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag3, sq3_data$pct_critical,
+        use = "pairwise.complete.obs")
+  ),
+  cor_mean_score = c(
+    cor(sq3_data$comp_total_lag1, sq3_data$mean_score,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag2, sq3_data$mean_score,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag3, sq3_data$mean_score,
+        use = "pairwise.complete.obs")
+  )
+)
+
+lag_cors |>
+  kable(digits = 4,
+        caption = "Lagged Correlations: Complaints in T vs Outcomes in T+N",
+        col.names = c("Lag Window","Cor w/ % Critical","Cor w/ Mean Score")) |>
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r sq3-plot}
+lag_cors |>
+  pivot_longer(starts_with("cor_"), names_to = "outcome",
+               values_to = "correlation") |>
+  mutate(outcome = recode(outcome,
+    "cor_pct_critical" = "% Critical Violations",
+    "cor_mean_score"   = "Mean Inspection Score")) |>
+  ggplot(aes(x = lag, y = correlation, fill = outcome)) +
+  geom_col(position = "dodge", width = 0.5) +
+  geom_hline(yintercept = 0, linewidth = 0.8) +
+  scale_fill_manual(values = c("#E76F51","#264653")) +
+  labs(title = "Do Complaint Spikes Predict Future Inspection Outcomes?",
+       subtitle = "Lagged Pearson correlations: complaints in month T vs outcomes in T+N",
+       x = "Complaint Lag Window", y = "Pearson Correlation", fill = "Outcome",
+       caption = "Sources: DOHMH Inspections, NYC 311 (2022-2026)") +
+  theme_nyc()
+```
+
+### Panel Regression with ZIP Fixed Effects
+
+```{r sq3-regression}
+# ZIP fixed effects absorb all time-invariant neighborhood characteristics,
+# including long-run differences in restaurant density, neighborhood income,
+# and inspection staffing. The remaining identification comes entirely from
+# within-ZIP changes in complaint volume over time. This is a much stricter
+# test than the pooled correlations above: it asks whether, within a given
+# ZIP code, months with unusually high complaint volumes are followed by
+# months with unusually high critical violation rates.
+sq3_model <- lm(
+  pct_critical ~ comp_total_lag1 + comp_total_lag2 +
+                 comp_total_lag3 + factor(zipcode),
+  data = sq3_data
+)
+
+# Display only the lag coefficients of interest
+tidy(sq3_model) |>
+  filter(str_detect(term, "comp_total_lag")) |>
+  kable(digits = 5,
+        caption = "Panel Regression (ZIP FE): Lagged Complaints to % Critical") |>
+  kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+---
+
+## Findings and Interpretation
+
+The lagged correlation analysis produces small but consistently positive correlations
+between prior complaint volume and subsequent inspection outcomes across all three
+lag windows and both outcome measures. The correlations for percent critical
+violations range from 0.028 to 0.031 across the three lags, while the correlations
+for mean inspection score range from 0.072 to 0.076. These magnitudes are substantially
+smaller than the contemporaneous cross-sectional correlation of 0.41 reported by the
+team's second analyst, which confirms the central hypothesis of this analysis: most
+of the complaint-outcome association operates in real time rather than through a
+temporal leading relationship.
+
+The panel regression with ZIP fixed effects provides the most rigorous test available
+with the current data. After removing all time-invariant neighborhood characteristics
+through ZIP fixed effects, none of the three lagged complaint predictors reaches
+statistical significance. The lag-1 coefficient is 0.00010 with a p-value of 0.455,
+the lag-2 coefficient is 0.00011 with a p-value of 0.482, and the lag-3 coefficient
+is negative at -0.00018 with a p-value of 0.206. The negative lag-3 coefficient,
+while not significant, is directionally inconsistent with a simple causal story in
+which complaints predict future deterioration.
+
+These results constitute an important and honest null finding. The null should not
+be read as evidence that complaints are uninformative: my teammates' cross-sectional
+analyses establish clearly that complaint volume and inspection outcomes are associated.
+Rather, the null temporal finding reveals the mechanism underlying that association.
+Both complaints and violations are simultaneous responses to persistent underlying
+neighborhood food safety conditions. A ZIP code with chronic food safety problems
+generates both 311 complaints and health code violations in the same months because
+the underlying conditions that produce both are relatively stable. When those
+underlying conditions fluctuate from month to month, complaint volume and violation
+rates move together rather than complaint volume leading violation rates by a fixed
+lag. The complaint system, in this view, is a concurrent mirror of food safety
+conditions rather than a predictive telescope pointed at future deterioration.
+
+There are three reasons to treat this null finding cautiously rather than as
+definitive. First, the monthly aggregation of inspection data introduces noise because
+inspections do not occur on a calendar-month schedule. A ZIP code's inspection
+outcomes in a given month reflect a potentially non-representative subset of its
+restaurants, making it difficult to detect smooth temporal relationships. Second, the
+three-month lag window may be too narrow. The team's fifth analyst demonstrates that
+complaint-triggered inspections arrive within days of the complaint, not months, which
+means any regulatory response operating through inspection acceleration would be
+captured in the same or adjacent month rather than at a three-month lag. Third,
+panel identification relies on within-ZIP temporal variation, which may be limited
+relative to the between-ZIP variation that drives the cross-sectional findings.
+
+---
+
+## Connection to the Overarching Question
+
+This analysis contributes to the team's overarching question by clarifying the
+temporal structure of the complaint-outcome relationship. The answer to whether
+high-complaint neighborhoods have worse inspection outcomes is yes, as established
+by the cross-sectional analyses. But the mechanism is not that complaints predict
+future deterioration; rather, complaints and violations co-occur as simultaneous
+signals of the same persistent food safety environment. This finding is important
+for policy because it shapes how 311 data should be used in regulatory planning.
+Rather than monitoring complaint trends for early warning signals of impending
+deterioration, regulators should treat current complaint volume as a real-time
+indicator of which neighborhoods are currently struggling with food safety compliance.
+The question of whether complaints also accelerate inspection timing, which would
+represent a direct regulatory response mechanism, is addressed in the team's fifth
+individual report.
+
+---
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
